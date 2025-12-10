@@ -71,3 +71,6 @@ print(f"Predicted class: {pred_label[0,0]}")
 ```
 
 
+## Current Results
+
+The highest model accuracy acheived with the current dataset is *`98.947%`*

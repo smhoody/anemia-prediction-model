@@ -41,12 +41,7 @@ This script will:
 - Train a small MLP for binary classification
 - Save the checkpoint to `anemia_model.pt` (includes `model_state`, `mean`, `std`)
 
-Programmatic usage — predict on new samples
-
-Use the provided `load_model_and_predict` helper to load a saved checkpoint and run inference. The helper applies the saved training mean/std scaling automatically.
-
-
-Terminal usage example:
+### Terminal usage example:
 
 ```powershell
 python model.py                    (show help menu)
@@ -54,8 +49,11 @@ python model.py --train            (train model and save model checkpoint)
 python model.py --test [values]    (e.g. --test 0,14,34,37,82)
 ```
 
+Programmatic usage — predict on new samples
 
-Code module example:
+Use the provided `load_model_and_predict` helper to load a saved checkpoint and run inference. The helper applies the saved training mean/std scaling automatically.
+
+### Code module example:
 
 ```python
 from model import load_model_and_predict

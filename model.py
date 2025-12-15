@@ -16,16 +16,32 @@ py model.py --test [sample]   (test existing model on sample)
 from __future__ import annotations
 
 import sys, os
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any
 
+import mlflow
+import mlflow.pytorch
 import numpy as np
+import pandas as pd
 import torch
+import optuna
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import util
 
+MODEL_OUTPUT_PATH = util.MODEL_OUTPUT_PATH
 
-MODEL_OUTPUT_PATH = "anemia_model.pt"
-EXPECTED_COLS = ["Gender", "Hemoglobin", "MCH", "MCHC", "MCV", "Result"]
+class HyperParams():
+    def __init__(self, epochs=20, lr=1e-3, batch_size=64):
+        self.epochs = epochs 
+        self.lr = lr
+        self.batch_size = batch_size
+    
+    def to_dict(self):
+        return {
+            "epochs": self.epochs,
+            "lr": self.lr,
+            "batch_size": self.batch_size
+        }
 
 class TabularDataset(Dataset):
     def __init__(self, X: np.ndarray, y: Optional[np.ndarray] = None):
@@ -49,7 +65,7 @@ class TabularDataset(Dataset):
 
 class AnemiaModel(nn.Module):
     def __init__(
-        self, input_dim: int = 5, hidden_dims=(64, 32), problem_type: str = "binary"
+        self, input_dim: int = 5, hidden_dims=(64, 32), dropout: float = 0.1
     ):
         """
         Small MLP for tabular data.
@@ -57,7 +73,7 @@ class AnemiaModel(nn.Module):
         Args:
             input_dim: number of input features (default 5)
             hidden_dims: tuple of hidden layer sizes
-            problem_type: 'binary' or 'regression'
+            dropout: float of dropout fraction
         """
         super().__init__()
         layers = []
@@ -66,11 +82,10 @@ class AnemiaModel(nn.Module):
             layers.append(nn.Linear(in_dim, h))
             layers.append(nn.ReLU())
             layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.Dropout(0.1))
+            layers.append(nn.Dropout(dropout))
             in_dim = h
         layers.append(nn.Linear(in_dim, 1))
         self.net = nn.Sequential(*layers)
-        self.problem_type = problem_type
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -79,24 +94,22 @@ class AnemiaModel(nn.Module):
 def train(
     model: nn.Module,
     train_loader: DataLoader,
-    val_loader: Optional[DataLoader] = None,
-    epochs: int = 300,
-    lr: float = 1e-3,
+    params: Dict[str, Any],
+    mean: Optional[np.ndarray] = None,
+    std: Optional[np.ndarray] = None,
     device: Optional[torch.device] = None,
-    problem_type: str = "binary",
-) -> Dict[str, Any]:
+) -> float:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    if problem_type == "binary":
-        loss_fn = nn.BCEWithLogitsLoss()
-    else:
-        loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr) # type: ignore
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"]) # type: ignore
+    final_loss = 0
 
-    history = {"train_loss": [], "val_loss": []}
-    for _ in range(1, epochs + 1):
+    # Log params to the currently active MLflow run (do not start a new run here).
+    mlflow.log_params(params)
+    for epoch in range(1, params["epochs"] + 1):
         model.train()
         running = 0.0
         count = 0
@@ -112,17 +125,20 @@ def train(
             count += xb.size(0)
 
         train_loss = running / max(1, count)
-        history["train_loss"].append(train_loss)
+        final_loss = train_loss
+        
+        mlflow.log_metrics(
+            {"train_loss": train_loss}, step=epoch
+        )
 
-        if val_loader is not None:
-            val_loss = evaluate(
-                model, val_loader, device=device, problem_type=problem_type
-            )["loss"]
-            history["val_loss"].append(val_loss)
-        else:
-            history["val_loss"].append(None)
+    mlflow.pytorch.log_model(model, name=model.__class__.__name__)
+    
+    if mean is not None and std is not None:
+        for i in range(mean.shape[1]):
+            mlflow.log_param(f"mean_{i}", float(mean[0, i]))
+            mlflow.log_param(f"std_{i}", float(std[0, i]))
 
-    return history
+    return final_loss
 
 
 def evaluate(
@@ -131,6 +147,11 @@ def evaluate(
         device: Optional[torch.device] = None, 
         problem_type: str = "binary"
 ) -> Dict[str, Any]:
+    """
+    Evaluates loss & accuracy
+    
+    :returns: {"loss": float, "accuracy", float}
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -206,86 +227,10 @@ def _train_val_split(
     return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
 
 
-def load_model_and_predict(
-    model_path: str,
-    X_new: np.ndarray,
-    device: Optional[torch.device] = None,
-    batch_size: int = 256,
-) -> np.ndarray:
-    """
-    Load a saved model and make predictions on new data.
+def get_loaders(hyper_params: Dict):
+    df = util.get_data()
 
-    Args:
-        model_path: path to the saved model checkpoint
-        X_new: input data, shape (n_samples, 5) with features [Gender, Hemoglobin, MCH,
-        MCHC, MCV]
-        device: torch device (default: cuda if available, else cpu)
-        batch_size: batch size for inference (default 256)
-
-    Returns:
-        predictions, shape (n_samples, 1). For binary classification, values are logits
-        (use sigmoid to get probabilities).
-
-    Example:
-        >>> preds = load_model_and_predict('anemia_model.pt', X_new_scaled)
-        >>> probs = 1 / (1 + np.exp(-preds))  # sigmoid for binary classification
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    model_state = checkpoint["model_state"]
-    mean = checkpoint["mean"]
-    std = checkpoint["std"]
-
-    # Instantiate model and load weights
-    model = AnemiaModel(input_dim=5, hidden_dims=(64, 32), problem_type="binary")
-    model.load_state_dict(model_state)
-    model.to(device)
-
-    # Scale input using saved training statistics
-    X_new = np.asarray(X_new)
-    X_new_scaled = (X_new - mean) / std
-
-    # Run prediction
-    preds = predict(model, X_new_scaled, device=device, batch_size=batch_size)
-    return preds
-
-
-def verify_data_labels(columns) -> List[str]:
-    """Ensure column order and extract arrays"""
-    for c in EXPECTED_COLS:
-        if c not in columns:
-            raise KeyError(f"Expected column {c} in dataframe")
-    return EXPECTED_COLS
-
-
-def train_model():
-    try:
-        import kagglehub
-        from kagglehub import KaggleDatasetAdapter
-
-        FILE_PATH = "anemia.csv"
-        df = kagglehub.dataset_load(KaggleDatasetAdapter.PANDAS, 
-                                    "biswaranjanrao/anemia-dataset", FILE_PATH)
-    except Exception:
-        raise FileNotFoundError("kagglehub not available or failed")
-
-    epochs = 10
-    lr = 1e-3
-    try:
-        if "-epochs" in sys.argv:
-            epoch_idx = sys.argv.index("-epochs")
-            epochs = int(sys.argv[epoch_idx+1])
-        if "-lr" in sys.argv:
-            lr_idx = sys.argv.index("-lr")
-            lr = float(sys.argv[lr_idx+1])
-    except Exception as e:
-        raise ValueError(f"Expected format as: py {os.path.basename(__file__)} \
-                         -epochs [int] -lr [float]")
-
-    EXPECTED_COLS = verify_data_labels(df.columns)
+    EXPECTED_COLS = util.verify_data_labels(df.columns)
     data = df[EXPECTED_COLS].to_numpy()
 
     X = data[:, :5]
@@ -301,40 +246,189 @@ def train_model():
 
     train_ds = TabularDataset(X_train_s, y_train)
     val_ds = TabularDataset(X_val_s, y_val)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=hyper_params["batch_size"], shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
 
-    model = AnemiaModel(input_dim=5, hidden_dims=(64, 32), problem_type="binary")
-    history = train(
-        model, 
-        train_loader, 
-        val_loader=val_loader, 
-        epochs=epochs, lr=lr, 
-        problem_type="binary"
-    )
-    print("Loss history:", [round(l, 5) for l in history["train_loss"]])
-
-    metrics = evaluate(model, val_loader, problem_type="binary")
-    print("Validation metrics:", metrics)
-
-    # Save the trained model
-    torch.save(
-        {
-            "model_state": model.state_dict(), 
-            "mean": mean, 
-            "std": std
-        }, 
-        MODEL_OUTPUT_PATH
-    )
-    print(f"Saved model to {MODEL_OUTPUT_PATH}")
+    return train_loader, val_loader, mean, std
 
 
-def test_model():
-    if not os.path.exists(MODEL_OUTPUT_PATH):
-        raise FileNotFoundError(
-            "Model checkpoint not found. Make sure to train before testing"
-        )
+def load_mlflow_model(
+    mode: str = "latest", device: Optional[torch.device] = None
+) -> Tuple[nn.Module, Optional[Dict[str, Any]]]:
+    """
+    Load an MLflow model by mode.
+
+    :param mode: "latest" or "best". "latest" loads the most recent run with a logged model.
+                 "best" loads the run with the lowest `loss` metric.
+    :returns: (model, metadata_dict) where metadata may contain 'mean' and 'std'
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    run_id = None
+    if mode == "best":
+        runs = mlflow.search_runs(max_results=1000)
+        if runs.empty:
+            raise ValueError("No MLflow runs found. Please train a model first.")
+        runs_with_loss = runs[runs["metrics.loss"].notna()].copy()
+        if runs_with_loss.empty:
+            raise ValueError("No runs with loss metric found. Please train a model first.")
+        runs_with_loss = runs_with_loss.sort_values("metrics.loss")
+        best_run = runs_with_loss.iloc[0]
+        run_id = best_run["run_id"]
+        best_loss = best_run["metrics.loss"]
+        print(f"Loading best model from run {run_id} with loss={best_loss:.6f}")
+    else:
+        runs = mlflow.search_runs(max_results=100, order_by=["start_time DESC"])
+        if runs.empty:
+            raise ValueError("No MLflow runs found. Please train a model first.")
+        # take the first run that successfully loads a model
+        for _, run in runs.iterrows():
+            candidate_run_id = run["run_id"]
+            try:
+                model_uri = f"runs:/{candidate_run_id}/AnemiaModel"
+                loaded = mlflow.pytorch.load_model(model_uri, map_location=device)
+                run_id = candidate_run_id
+                break
+            except Exception:
+                continue
+        if run_id is None:
+            raise ValueError("No valid logged PyTorch model found in recent MLflow runs.")
+
+    # Load the model if not already loaded (for 'best' mode)
+    if mode == "best":
+        model_uri = f"runs:/{run_id}/AnemiaModel"
+        loaded = mlflow.pytorch.load_model(model_uri, map_location=device)
+
+    # Try to load metadata (mean/std) from logged parameters
+    metadata = None
+    try:
+        # Get the run object to access params
+        run_info = mlflow.tracking.MlflowClient().get_run(run_id)
+        params = run_info.data.params
+        
+        # Try to extract mean and std arrays from params
+        mean_vals = []
+        std_vals = []
+        for i in range(10):  # Check up to 10 features
+            mean_key = f"mean_{i}"
+            std_key = f"std_{i}"
+            if mean_key in params and std_key in params:
+                mean_vals.append(float(params[mean_key]))
+                std_vals.append(float(params[std_key]))
+            else:
+                break
+        
+        if mean_vals and std_vals:
+            metadata = {
+                "mean": np.array(mean_vals, dtype=np.float32).reshape(1, -1),
+                "std": np.array(std_vals, dtype=np.float32).reshape(1, -1)
+            }
+    except Exception:
+        metadata = None
+
+    return loaded, metadata
+
+
+def predict_with_mlflow_model(
+    X_new: np.ndarray,
+    device: Optional[torch.device] = None,
+    batch_size: int = 256,
+    mode: str = "latest",
+) -> np.ndarray:
+    """
+    Load the latest MLflow model and predict on new data.
+    Scales input using saved training statistics if available.
     
+    :param X_new: input features (n_samples, n_features) or (n_features,) for single sample
+    :returns: predictions (n_samples, 1)
+    """
+    model, metadata = load_mlflow_model(mode=mode, device=device)
+    
+    X_new = np.asarray(X_new)
+    
+    if X_new.ndim == 1:
+        X_new = X_new.reshape(1, -1)
+    
+    # Scale if we have mean/std from metadata
+    if metadata and "mean" in metadata and "std" in metadata:
+        mean = metadata["mean"]
+        std = metadata["std"]
+        X_new = (X_new - mean) / std
+    
+    preds = predict(model, X_new, device=device, batch_size=batch_size)
+    return preds
+
+
+def objective(trial):
+    #Default params
+    hyper_params = HyperParams(
+        epochs = 10,
+        lr = 1e-3,
+        batch_size = 64
+    )
+
+    #Get any arguments passed from terminal
+    util.set_train_args_from_sys(hyper_params)
+
+
+    with mlflow.start_run(nested=True):
+        n_layers = trial.suggest_int("n_layers", 1, 5)
+        hidden_dims = tuple(
+            trial.suggest_int(f"hidden_dim_{i}", 16, 256)
+            for i in range(n_layers)
+        )
+
+        hyper_params = {
+            "epochs": trial.suggest_int("epochs", 10, 100),
+            "lr": trial.suggest_float("lr", 1e-3, 1e-1, log=True),
+            "batch_size": trial.suggest_int("batch_size", 16, 128),
+            "dropout": trial.suggest_float("dropout", 0.1, 0.4)
+        }
+        mlflow.log_params(hyper_params)
+        mlflow.log_param("n_layers", n_layers)
+        for i, h in enumerate(hidden_dims):
+            mlflow.log_param(f"hidden_dim_{i}", h)
+
+        train_loader, val_loader, mean, std = get_loaders(hyper_params)
+
+        model = AnemiaModel(
+            input_dim=5, hidden_dims=hidden_dims, dropout=hyper_params["dropout"]
+        )
+
+        loss = train(
+            model,
+            train_loader,
+            params=hyper_params,
+            mean=mean,
+            std=std
+        )
+        
+        # Log scaling stats from training
+        for i in range(mean.shape[1]):
+            mlflow.log_param(f"mean_{i}", float(mean[0, i]))
+            mlflow.log_param(f"std_{i}", float(std[0, i]))
+        
+        mlflow.log_metric("loss", loss)
+
+        return loss
+
+
+def train_model():
+    with mlflow.start_run(run_name="Anemia Model HP Optimization"):
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=5)
+
+        mlflow.log_params({f"best_{k}": v for k,v in study.best_params.items()})
+        mlflow.log_metric("best_loss", study.best_value)
+
+
+def test_model(mode: str = "latest"):
+    """
+    Test the model on a new sample.
+    
+    :param mode: "latest" to load the most recent model, or "best" to load the model with lowest loss
+    """
     sample = []
     try: 
         sample = np.array([float(n) for n in sys.argv[2].split(',')])
@@ -344,8 +438,20 @@ def test_model():
             f"Expected sample usage: py {os.path.basename(__file__)} --test 0,16,29,35.4,82"
         )
 
-    print("\n--- Making prediction on new sample ---")
-    logits = load_model_and_predict(MODEL_OUTPUT_PATH, sample)
+    print(f"\n--- Making prediction on new sample using {mode} MLflow model ---")
+    
+    try:
+        model, metadata = load_mlflow_model(mode=mode)
+        
+        # Reshape and scale the input
+        X_new = sample.reshape(1, -1)
+        if metadata and "mean" in metadata and "std" in metadata:
+            X_new = (X_new - metadata["mean"]) / metadata["std"]
+        
+        logits = predict(model, X_new)
+    except (ValueError, FileNotFoundError) as e:
+        raise FileNotFoundError(f"Could not load model from MLflow. Make sure to train first ({e})")
+   
     probs = 1 / (1 + np.exp(-logits))
     pred_label = (probs >= 0.5).astype(int)[0, 0]
     print(f"Input features: {sample}")
@@ -353,38 +459,12 @@ def test_model():
     print(f"Predicted label (binary): {pred_label}")
 
 
-def help():
-    file = os.path.basename(__file__)
-    print("\n\t--- Help ---")
-    print("\nTrain argument examples:")
-    print(f" Default (epochs=10): py {file} --train")
-    print(f"       Custom epochs: py {file} --train -epochs 50")
-    print(f"Custom learning rate: py {file} --train -lr 0.01")
-    print(f"  Custom epochs & lr: py {file} --train -epochs 100 -lr 0.0001")
-
-    print("\nTest argument examples:")
-    print(f"          Test model: py {file} --test {",".join(EXPECTED_COLS[:-1])}")
-    print(f"          Test model: py {file} --test 0,16,29,35.4,82")
-    print("note: gender field has 2 values -- male=0 female=1")
-
-    print("\nTrain Output:")
-    print("\tLoss history: list of model losses during each epoch")
-    print(
-        "\tValidation metrics: 'loss' is the final loss, 'accuracy' \
-        is the final model accuracy")
-    print(f"\tSaved model to {MODEL_OUTPUT_PATH}: pt model file save location")
-
-    print("\nTest Output:")
-    print("\tInput features: list of features given")
-    print("\tPredicted probability: probability of patient having anemia")
-    print("\tPredicted label (binary): 0 = not anemic, 1 = anemic")
-
 
 if __name__ == "__main__":
-    
     arg_funcs = {
         "--train": train_model,
-        "--test": test_model
+        "--test": lambda: test_model("latest"),
+        "--test-best": lambda: test_model("best")
     }
 
     if len(sys.argv) == 1: 

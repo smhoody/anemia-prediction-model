@@ -1,5 +1,6 @@
 torch>=1.13.0
 numpy>=1.24
 pandas>=1.5
-# Optional: kagglehub (used to fetch dataset when available)
-# kagglehub>=0.1.0
+mlflow>=3.7.0
+optuna>=4.6.0
+kagglehub>=0.1.0

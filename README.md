@@ -8,7 +8,7 @@ Project layout
 
 Dataset
 - Expected input columns: `Gender` (int), `Hemoglobin` (float), `MCH` (float), `MCHC` (float), `MCV` (float), `Result` (target — binary or continuous depending on dataset).
-- The repository example uses the Kaggle dataset [https://www.kaggle.com/datasets/biswaranjanrao/anemia-dataset](`biswaranjanrao/anemia-dataset`) when `kagglehub` is available; otherwise a synthetic dataset is generated for demonstration.
+- The repository example uses the Kaggle dataset [`biswaranjanrao/anemia-dataset`](https://www.kaggle.com/datasets/biswaranjanrao/anemia-dataset) when `kagglehub` is available; otherwise a synthetic dataset is generated for demonstration.
 
 Installation
 
